@@ -47,9 +47,9 @@ export class PromiseWithStatus<T> implements Promise<T> {
         return value;
       },
       (reason) => {
+        // We suppress error here to avoid unhandled promise rejection and handle the error with status
         this._status = "rejected";
         this._reason = reason;
-        throw reason;
       }
     );
   }

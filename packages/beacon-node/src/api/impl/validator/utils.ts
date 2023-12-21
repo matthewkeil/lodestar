@@ -1,17 +1,35 @@
-import {fromHexString} from "@chainsafe/ssz";
+import {fromHexString, toHexString} from "@chainsafe/ssz";
 import {
   BeaconStateAllForks,
   CachedBeaconStateAllForks,
   computeSlotsSinceEpochStart,
   computeStartSlotAtEpoch,
 } from "@lodestar/state-transition";
-import {ATTESTATION_SUBNET_COUNT, SLOTS_PER_EPOCH} from "@lodestar/params";
-import {BLSPubkey, CommitteeIndex, Epoch, Root, Slot, ValidatorIndex, phase0, ssz} from "@lodestar/types";
+import {ATTESTATION_SUBNET_COUNT, SLOTS_PER_EPOCH, isForkBlobs} from "@lodestar/params";
+import {
+  BLSPubkey,
+  BLSSignature,
+  CommitteeIndex,
+  Epoch,
+  ProducedBlockSource,
+  Root,
+  Slot,
+  ValidatorIndex,
+  allForks,
+  bellatrix,
+  phase0,
+  ssz,
+} from "@lodestar/types";
 import {ExecutionStatus, IForkChoice} from "@lodestar/fork-choice";
+import {toHex} from "@lodestar/utils";
+import {routes} from "@lodestar/api";
 import {IBeaconChain, ChainEvent, CheckpointHex} from "../../../chain/index.js";
 import {SyncState} from "../../../sync/interface.js";
 import {ApiError, NodeIsSyncing} from "../errors.js";
 import {IClock} from "../../../util/clock.js";
+import {toGraffitiBuffer} from "../../../util/graffiti.js";
+import {ApiModules} from "../types.js";
+import {ValidatorEndpointDependencies} from "./endpoints/types.js";
 
 export function computeSubnetForCommitteesAtSlot(
   slot: Slot,
@@ -221,4 +239,84 @@ export function isValidBeaconBlockRoot({
     throw new NodeIsSyncing(
       `Block's execution payload not yet validated, executionPayloadBlockHash=${protoBeaconBlock.executionPayloadBlockHash} number=${protoBeaconBlock.executionPayloadNumber}`
     );
+}
+
+export async function produceBlindedBlockOrContents(
+  {chain, metrics, logger, config}: ApiModules,
+  {notWhileSyncing, waitForSlotWithDisparity}: ValidatorEndpointDependencies,
+  // as of now fee recipient checks can not be performed because builder does not return bid recipient
+  {
+    slot,
+    randaoReveal,
+    graffiti,
+    skipHeadChecksAndUpdate,
+  }: Omit<routes.validator.ExtraProduceBlockOps, "builderSelection"> & {
+    skipHeadChecksAndUpdate?: boolean;
+    slot: Slot;
+    randaoReveal: BLSSignature;
+    graffiti: string;
+  }
+): Promise<routes.validator.ProduceBlindedBlockOrContentsRes> {
+  const source = ProducedBlockSource.builder;
+  metrics?.blockProductionRequests.inc({source});
+
+  // Error early for builder if builder flow not active
+  if (!chain.executionBuilder) {
+    throw Error("Execution builder not set");
+  }
+  if (!chain.executionBuilder.status) {
+    throw Error("Execution builder disabled");
+  }
+
+  if (skipHeadChecksAndUpdate !== true) {
+    notWhileSyncing();
+    await waitForSlotWithDisparity(slot); // Must never request for a future slot > currentSlot
+
+    // Process the queued attestations in the forkchoice for correct head estimation
+    // forkChoice.updateTime() might have already been called by the onSlot clock
+    // handler, in which case this should just return.
+    chain.forkChoice.updateTime(slot);
+    chain.recomputeForkChoiceHead();
+  }
+
+  let timer;
+  try {
+    timer = metrics?.blockProductionTime.startTimer();
+    const {block, executionPayloadValue, consensusBlockValue} = await chain.produceBlindedBlock({
+      slot,
+      randaoReveal,
+      graffiti: toGraffitiBuffer(graffiti || ""),
+    });
+
+    metrics?.blockProductionSuccess.inc({source});
+    metrics?.blockProductionNumAggregated.observe({source}, block.body.attestations.length);
+    logger.verbose("Produced blinded block", {
+      slot,
+      executionPayloadValue,
+      consensusBlockValue,
+      root: toHexString(config.getBlindedForkTypes(slot).BeaconBlock.hashTreeRoot(block)),
+    });
+
+    const version = config.getForkName(block.slot);
+    if (chain.opts.persistProducedBlocks) {
+      void chain.persistBlock(block, "produced_builder_block");
+    }
+    if (isForkBlobs(version)) {
+      const blockHash = toHex((block as bellatrix.BlindedBeaconBlock).body.executionPayloadHeader.blockHash);
+      const blindedBlobSidecars = chain.producedBlindedBlobSidecarsCache.get(blockHash);
+      if (blindedBlobSidecars === undefined) {
+        throw Error("blobSidecars missing in cache");
+      }
+      return {
+        data: {blindedBlock: block, blindedBlobSidecars} as allForks.BlindedBlockContents,
+        version,
+        executionPayloadValue,
+        consensusBlockValue,
+      };
+    } else {
+      return {data: block, version, executionPayloadValue, consensusBlockValue};
+    }
+  } finally {
+    if (timer) timer({source});
+  }
 }
